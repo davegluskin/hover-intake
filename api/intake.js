@@ -55,17 +55,8 @@ export default async function handler(req, res) {
       });
     if (mkErr) throw mkErr;
 
-    // 4) systems
-    const { error: sysErr } = await supabase
-      .from('systems')
-      .insert({
-        client_id,
-        calendly_url: p.systems?.calendly_url || null,
-        idx_pattern: p.systems?.idx_source || null
-      });
-    if (sysErr) throw sysErr;
 
-    // 5) status
+    // 4) status
     const { error: stErr } = await supabase
       .from('status')
       .insert({
