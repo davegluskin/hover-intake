@@ -1,73 +1,58 @@
-// api/intake.js
+// pages/api/intake.js
+import { createClient } from "@supabase/supabase-js";
+
+export const config = {
+  api: { bodyParser: true, sizeLimit: "2mb" },
+};
+
+function need(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing env var: ${name}`);
+  return v;
+}
+
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).send('Use POST');
-
-  const SUPABASE_URL = process.env.SUPABASE_URL;
-  const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-
-  const { createClient } = await import('@supabase/supabase-js');
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY);
-
   try {
-    const p = req.body || {};
+    if (req.method === "GET") {
+      return res.status(200).json({ ok: true, hint: "Send POST with JSON body" });
+    }
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "Use POST" });
+    }
 
-    // 1) create client
-    const { data: clientRow, error: clientErr } = await supabase
-      .from('clients')
-      .insert({
-        org_name: p.business?.legal_name || null,
-        contact_name: p.contact?.name || null,
-        email: p.contact?.email,
-        phone: p.contact?.phone || null,
-        legal_name: p.business?.legal_name,
-        brokerage: p.business?.brokerage || null,
-        website: p.business?.website || null,
-        tier: p.package?.tier || 'Starter'
-      })
-      .select('id')
+    const payload = req.body;
+    console.log("INTAKE payload:", JSON.stringify(payload, null, 2)); // <— see exact shape in Vercel logs
+
+    // Accept several common keys to avoid nulls
+    const email =
+      payload?.email ??
+      payload?.contact_email ??
+      payload?.client?.email ??
+      null;
+
+    if (!email) {
+      return res.status(400).json({ ok: false, error: "Missing required field: email" });
+    }
+
+    const full_name =
+      payload?.full_name ?? payload?.name ?? payload?.client?.full_name ?? null;
+
+    const supabase = createClient(need("SUPABASE_URL"), need("SUPABASE_SERVICE_ROLE_KEY"));
+
+    const { data: clientRow, error: cErr } = await supabase
+      .from("clients")
+      .insert({ email, full_name })
+      .select()
       .single();
-    if (clientErr) throw clientErr;
-    const client_id = clientRow.id;
 
-    // 2) brand kit
-    const { error: bkErr } = await supabase
-      .from('brand_kits')
-      .insert({
-        client_id,
-        primary_color: p.brand?.colors?.[0] || '#0A6FFF',
-        secondary_color: p.brand?.colors?.[1] || null,
-        font_main: (p.brand?.fonts && p.brand.fonts[0]) || 'Inter',
-        // MVP: save Fillout file URLs directly (we can move to Supabase Storage later)
-        logo_url: p.brand?.assets?.logo_url,
-        headshot_url: p.brand?.assets?.headshot_url || null,
-        disclaimer: p.business?.disclaimer || 'Equal Housing Opportunity.'
-      });
-    if (bkErr) throw bkErr;
+    if (cErr) {
+      console.error("Insert clients failed:", cErr);
+      return res.status(500).json({ ok: false, error: cErr.message });
+    }
 
-    // 3) markets
-    const { error: mkErr } = await supabase
-      .from('markets')
-      .insert({
-        client_id,
-        zips: p.market?.zips || [],
-        cities: p.market?.cities || [],
-        niches: p.market?.niches || []
-      });
-    if (mkErr) throw mkErr;
-
-
-    // 4) status
-    const { error: stErr } = await supabase
-      .from('status')
-      .insert({
-        client_id,
-        intake_complete: true,
-        connections_ready: false
-      });
-    if (stErr) throw stErr;
-
-    return res.status(200).json({ ok: true, client_id });
+    return res.status(200).json({ ok: true, client_id: clientRow.id });
   } catch (e) {
-    return res.status(400).json({ ok: false, error: String(e.message || e) });
+    console.error("INTAKE_FATAL:", e);
+    return res.status(500).json({ ok: false, error: e.message || "Server error" });
   }
 }
