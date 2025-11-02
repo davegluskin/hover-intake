@@ -1,8 +1,11 @@
 // pages/api/intake.js
 //
-// Works with Fillout free tier (no Developer Mode).
-// It matches question labels like "Contact Email", "Legal Business Name", etc.
-// and inserts cleanly into Supabase.
+// Ultra-forgiving handler for Fillout:
+// - Works when Advanced view is OFF (submission.questions)
+// - Also works with Advanced view ON (top-level mapped keys)
+// - Reads by keys, labels, question names, and even type (EmailInput)
+// - Last resort: regex scan anywhere for an email
+// - Friendly 400s for missing required fields
 
 import { createClient } from "@supabase/supabase-js";
 
@@ -16,32 +19,99 @@ function need(name) {
   return v;
 }
 
-// Find a value inside Fillout's "answers" array by matching label text
-function getFromLabels(payload, label) {
-  try {
-    const arr = payload?.answers || payload?.data || payload?.fields || null;
-    if (!Array.isArray(arr)) return null;
+const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
 
-    // Look for an exact or partial label match
-    const match = arr.find((a) => {
-      const lbl = (a?.label || a?.name || a?.title || "").toLowerCase();
-      return lbl.includes(label.toLowerCase());
-    });
-    return match?.value ?? match?.text ?? match?.answer ?? null;
-  } catch {
+// Depth-first walk of string values
+function* walkStrings(node) {
+  if (typeof node === "string") yield node;
+  else if (Array.isArray(node)) for (const it of node) yield* walkStrings(it);
+  else if (isObj(node)) for (const k of Object.keys(node)) yield* walkStrings(node[k]);
+}
+
+// ----- Extractors -----
+function getByKeys(payload, keys = []) {
+  const tryKeys = (obj) => {
+    for (const k of keys) {
+      if (obj?.[k] != null) return obj[k];
+    }
     return null;
+  };
+  // direct
+  const direct = tryKeys(payload);
+  if (direct != null) return direct;
+  // common containers
+  for (const box of ["submission", "responses", "response", "client", "data", "hidden", "variables"]) {
+    const v = payload?.[box];
+    if (isObj(v)) {
+      const found = tryKeys(v);
+      if (found != null) return found;
+    }
   }
+  return null;
 }
 
-// Remove nulls so Postgres defaults can apply
-function pruneNulls(obj) {
-  const copy = { ...obj };
-  for (const k of Object.keys(copy)) {
-    if (copy[k] == null) delete copy[k];
+function getFromLabelsArrayish(arr, wantedLabels = []) {
+  if (!Array.isArray(arr)) return null;
+  const norm = (s) => (s || "").toString().trim().toLowerCase();
+  const wants = wantedLabels.map(norm);
+  for (const item of arr) {
+    const lbl = norm(item?.label || item?.name || item?.title);
+    if (wants.some((w) => lbl.includes(w))) {
+      return item?.value ?? item?.text ?? item?.answer ?? item?.url ?? item?.email ?? null;
+    }
   }
-  return copy;
+  return null;
 }
 
+function getByLabel(payload, labels = []) {
+  const arr = payload?.answers || payload?.data || payload?.fields || payload?.items || null;
+  return getFromLabelsArrayish(arr, labels);
+}
+
+// NEW: read from submission.questions by name (what your log showed)
+function getFromQuestionsByName(payload, wantedNames = []) {
+  const q = payload?.submission?.questions;
+  return getFromLabelsArrayish(q, wantedNames);
+}
+
+// NEW: fallback — first EmailInput question with a non-null value
+function getEmailFromQuestionsByType(payload) {
+  const q = payload?.submission?.questions;
+  if (!Array.isArray(q)) return null;
+  for (const item of q) {
+    const t = (item?.type || "").toString().toLowerCase();
+    if (t.includes("email")) {
+      if (item?.value) return item.value;
+    }
+  }
+  return null;
+}
+
+function normalizeTier(raw) {
+  if (!raw || typeof raw !== "string") return null;
+  const s = raw.trim().toLowerCase();
+  if (["starter", "start", "basic"].includes(s)) return "Starter";
+  if (["growth", "grow"].includes(s)) return "Growth";
+  if (["premium", "pro"].includes(s)) return "Premium";
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}
+
+function findAnyEmail(payload) {
+  const re = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i;
+  for (const s of walkStrings(payload)) {
+    const m = s.match(re);
+    if (m) return m[0];
+  }
+  return null;
+}
+
+function prune(obj) {
+  const out = { ...obj };
+  for (const k of Object.keys(out)) if (out[k] == null) delete out[k];
+  return out;
+}
+
+// ----- Handler -----
 export default async function handler(req, res) {
   try {
     if (req.method === "GET") {
@@ -51,38 +121,50 @@ export default async function handler(req, res) {
       return res.status(405).json({ ok: false, error: "Use POST" });
     }
 
-    const payload = req.body;
-    console.log("INTAKE payload:", JSON.stringify(payload, null, 2));
+    const payload = req.body || {};
+    try {
+      console.log("INTAKE top-level keys:", Object.keys(payload || {}));
+      console.log("INTAKE submission keys:", Object.keys(payload?.submission || {}));
+      console.log("INTAKE questions count:", Array.isArray(payload?.submission?.questions) ? payload.submission.questions.length : 0);
+    } catch {}
 
-    // Try to find by label text (works without Developer Mode)
-    const email = getFromLabels(payload, "Contact Email") || getFromLabels(payload, "Email");
-    const legal_name = getFromLabels(payload, "Legal Business Name") || getFromLabels(payload, "Company");
-    const full_name = getFromLabels(payload, "Contact Name") || getFromLabels(payload, "Name");
-    const tierRaw = getFromLabels(payload, "Package") || getFromLabels(payload, "Tier") || "Starter";
+    // EMAIL: try many strategies
+    const email =
+      getByKeys(payload, ["email", "contact_email", "agent_email", "email_address"]) ||
+      getByLabel(payload, ["contact email", "email"]) ||
+      getFromQuestionsByName(payload, ["contact email", "email"]) ||
+      getEmailFromQuestionsByType(payload) ||
+      findAnyEmail(payload);
 
-    // Normalize tier capitalization
-    let tier = tierRaw;
-    if (typeof tierRaw === "string") {
-      const s = tierRaw.trim().toLowerCase();
-      if (["starter", "start", "basic"].includes(s)) tier = "Starter";
-      else if (["growth", "grow"].includes(s)) tier = "Growth";
-      else if (["premium", "pro"].includes(s)) tier = "Premium";
-      else tier = s.charAt(0).toUpperCase() + s.slice(1);
-    }
+    // LEGAL NAME
+    let legal_name =
+      getByKeys(payload, ["legal_name", "company", "business_name", "organization"]) ||
+      getByLabel(payload, ["legal business name", "company", "business name"]) ||
+      getFromQuestionsByName(payload, ["legal business name", "company", "business name"]);
 
-    // Basic validation
-    if (!email) return res.status(400).json({ ok: false, error: "Missing required field: email" });
+    // FULL NAME
+    const full_name =
+      getByKeys(payload, ["full_name", "name", "contact_name", "agent_name"]) ||
+      getByLabel(payload, ["contact name", "name"]) ||
+      getFromQuestionsByName(payload, ["contact name", "name"]);
+
+    if (!legal_name) legal_name = full_name || null;
+
+    // TIER
+    const rawTier =
+      getByKeys(payload, ["tier", "package", "plan", "subscription"]) ||
+      getByLabel(payload, ["package", "tier", "plan"]) ||
+      getFromQuestionsByName(payload, ["package", "tier", "plan"]) ||
+      "Starter";
+    const tier = normalizeTier(rawTier);
+
+    if (!email)   return res.status(400).json({ ok: false, error: "Missing required field: email" });
     if (!legal_name) return res.status(400).json({ ok: false, error: "Missing required field: legal_name" });
-    if (!tier) return res.status(400).json({ ok: false, error: "Missing required field: tier" });
+    if (!tier)    return res.status(400).json({ ok: false, error: "Missing required field: tier" });
 
     const supabase = createClient(need("SUPABASE_URL"), need("SUPABASE_SERVICE_ROLE_KEY"));
 
-    const insertData = pruneNulls({
-      email,
-      legal_name,
-      full_name,
-      tier,
-    });
+    const insertData = prune({ email, legal_name, full_name, tier });
 
     const { data: clientRow, error: cErr } = await supabase
       .from("clients")
@@ -91,7 +173,7 @@ export default async function handler(req, res) {
       .single();
 
     if (cErr) {
-      console.error("Insert clients failed:", cErr);
+      console.error("Insert into clients failed:", cErr);
       return res.status(500).json({ ok: false, error: cErr.message });
     }
 
